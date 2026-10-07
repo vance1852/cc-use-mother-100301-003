@@ -8,13 +8,60 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .coldchain import ColdChainService
 from .errors import DomainError, ValidationError
 from .service import DomainService
 from .storage import Database
 
 
+def _created(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """按幂等回执选择 201 或 200。"""
+
+    return (200 if payload.get("replayed") else 201), payload
+
+
+def _coldchain_route(coldchain: ColdChainService, method: str, parsed,
+                     body: dict[str, Any], actor_id: str) -> tuple[int, dict[str, Any]]:
+    """分派冷链判定项目的请求。"""
+
+    if method == "POST" and parsed.path == "/coldchain/plans":
+        return _created(coldchain.lock_plan(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/coldchain/readings":
+        return _created(coldchain.ingest_readings(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/coldchain/assessments":
+        return _created(coldchain.compute_assessment(actor_id=actor_id, **body))
+    if method == "GET" and parsed.path == "/coldchain/assessment":
+        query = parse_qs(parsed.query)
+        site_id = query.get("site_id", [""])[0]
+        batch_id = query.get("batch_id", [""])[0]
+        if not site_id or not batch_id:
+            raise ValidationError("site_id 和 batch_id 不能为空")
+        version = query.get("version", [None])[0]
+        return 200, coldchain.get_assessment(actor_id=actor_id, site_id=site_id,
+                                             batch_id=batch_id,
+                                             version=int(version) if version else None)
+    if method == "POST" and parsed.path == "/coldchain/determinations":
+        return _created(coldchain.submit_determination(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/coldchain/withdrawals":
+        return _created(coldchain.withdraw_decision(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/coldchain/obligations/complete":
+        return _created(coldchain.complete_obligation(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/coldchain/reports":
+        return _created(coldchain.create_report(actor_id=actor_id, **body))
+    if method == "GET" and parsed.path == "/coldchain/disposition":
+        query = parse_qs(parsed.query)
+        site_id = query.get("site_id", [""])[0]
+        batch_id = query.get("batch_id", [""])[0]
+        if not site_id or not batch_id:
+            raise ValidationError("site_id 和 batch_id 不能为空")
+        return 200, coldchain.disposition_record(actor_id=actor_id, site_id=site_id,
+                                                 batch_id=batch_id)
+    return 404, {"error": "route_not_found", "message": "接口不存在"}
+
+
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          coldchain: ColdChainService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
@@ -22,6 +69,10 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
     try:
+        if parsed.path.startswith("/coldchain"):
+            if coldchain is None:
+                return 404, {"error": "route_not_found", "message": "接口不存在"}
+            return _coldchain_route(coldchain, method, parsed, body, actor_id)
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
             return 200, {"status": "ok", "audit_valid": valid, "audit_events": count}
@@ -59,6 +110,7 @@ class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    coldchain: ColdChainService | None = None
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +121,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                coldchain=self.coldchain)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +153,7 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.coldchain = ColdChainService(Handler.service)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
