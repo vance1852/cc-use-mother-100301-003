@@ -16,7 +16,7 @@ from .storage import Database
 
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
-ROLES = frozenset({"admin", "operator", "reviewer", "auditor"})
+ROLES = frozenset({"admin", "operator", "reviewer", "auditor", "researcher", "quality"})
 
 
 class DomainService:
@@ -53,6 +53,23 @@ class DomainService:
     def _require(self, actor: Actor, *roles: str) -> None:
         if actor.role not in roles:
             raise PermissionDenied("当前角色不能执行该动作")
+
+    def authenticate(self, connection, actor_id: str) -> Actor:
+        """供扩展模块复用的操作者校验入口。"""
+
+        return self._actor(connection, actor_id)
+
+    def require_role(self, actor: Actor, *roles: str) -> None:
+        """供扩展模块复用的角色校验入口。"""
+
+        self._require(actor, *roles)
+
+    def run_idempotent(self, connection, *, request_id: str, action: str,
+                       payload: dict[str, Any], create: Callable[[], tuple[str, str, dict[str, Any]]]) -> WriteReceipt:
+        """供扩展模块复用的幂等回执入口。"""
+
+        return self._idempotent(connection, request_id=request_id, action=action,
+                                payload=payload, create=create)
 
     def _idempotent(self, connection, *, request_id: str, action: str,
                     payload: dict[str, Any], create: Callable[[], tuple[str, str, dict[str, Any]]]) -> WriteReceipt:
